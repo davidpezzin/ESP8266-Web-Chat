@@ -1,0 +1,1393 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <SPI.h>
+#include <SD.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <time.h>
+
+// ===================== CONFIG =====================
+
+// Wi-Fi
+const char* WIFI_SSID = "Florenca";
+const char* WIFI_PASS = "Beneecuca1";
+
+// Porta HTTP
+const uint16_t HTTP_PORT = 8090;
+ESP8266WebServer server(HTTP_PORT);
+
+// Login (aparece como Usuário 1/2) -> Nome real no chat
+const char* LOGIN1 = "";
+const char* PASS1  = "";
+const char* NAME1  = "";
+
+const char* LOGIN2 = "";
+const char* PASS2  = "";
+const char* NAME2  = "";
+
+// SD
+const int SD_CS = D0;                 // CS no D0
+const char* LOG_PATH = "/chat.log";
+bool sdOk = false;
+
+// OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// FLASH button (GPIO0 = D3)
+const int FLASH_PIN = D3;             // GPIO0
+const uint32_t WARN_PRESS_MS  = 3000; // 3s: aviso
+const uint32_t ERASE_PRESS_MS = 5000; // 5s: apaga
+bool btnDown = false;
+uint32_t btnDownMs = 0;
+uint32_t lastBtnEdgeMs = 0;
+bool warnShown = false;
+
+// OLED pages
+uint8_t oledPage = 0;
+const uint8_t OLED_PAGES = 4;         // 0..3
+
+// (Opcional) URL público para mostrar em uma página
+const char* PUBLIC_URL = "http://179.99.97.28:8090/";
+
+// Stats
+uint32_t msgTotal = 0;
+uint32_t newMsgs  = 0;
+uint32_t logBytes = 0;
+uint32_t lastUiMs = 0;
+
+// ===================== SITE ON/OFF (ADMIN) =====================
+// Quando true: derruba o site até clicar no FLASH
+bool siteDisabled = false;
+String siteDisabledBy = "";
+uint32_t siteDisabledAtMs = 0;
+
+// ===================== PRESENÇA (ONLINE / ÚLTIMO ACESSO) =====================
+struct Presence {
+  String user;
+  uint64_t lastSeenEpochMs = 0; // epoch em ms
+  uint32_t lastSeenMillis  = 0; // millis local
+};
+Presence presence1, presence2;
+const uint32_t ONLINE_WINDOW_MS = 15000; // 15s
+
+// ===================== CHAT BUFFER =====================
+
+struct Msg {
+  uint32_t id;
+  uint64_t ts;   // ms
+  String name;
+  String text;
+  bool deleted;
+
+  // Reply tipo WhatsApp
+  uint32_t replyToId;     // 0 = sem reply
+  String replyToName;     // snapshot
+  String replyToText;     // snapshot (já “— apagada —” se estava apagada na hora)
+};
+
+const uint16_t BUF_MAX = 200;
+Msg buf[BUF_MAX];
+uint16_t bufCount = 0;
+uint16_t bufHead  = 0;
+uint32_t nextId   = 1;
+
+// Sessions (token por IP)
+struct ChatSession {
+  bool used = false;
+  String token;
+  String user;       // "Anja"/"David"
+  IPAddress ip;
+  uint32_t issuedMs = 0;
+  bool pageServed = false;
+};
+ChatSession chatSessions[6];
+const uint32_t SESSION_TTL_MS = 60UL * 60UL * 1000UL;
+
+// ===================== UTILS =====================
+
+void noCacheHeaders(){
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
+}
+
+String jsonEscape(const String& s){
+  String o; o.reserve(s.length()+10);
+  for (size_t i=0;i<s.length();i++){
+    char c = s[i];
+    if(c=='\\' || c=='"') { o += '\\'; o += c; }
+    else if(c=='\n') o += "\\n";
+    else if(c=='\r') o += "\\r";
+    else if(c=='\t') o += "\\t";
+    else o += c;
+  }
+  return o;
+}
+
+String getField(const String& raw, const char* key){
+  String k = String("\"") + key + "\":";
+  int p = raw.indexOf(k);
+  if(p<0) return "";
+  p += k.length();
+  while(p<(int)raw.length() && raw[p]==' ') p++;
+  if(p<(int)raw.length() && raw[p]=='"'){
+    p++;
+    int e = raw.indexOf("\"", p);
+    if(e<0) return "";
+    return raw.substring(p, e);
+  }
+  return "";
+}
+
+uint64_t parseUint64(const String& s){
+  uint64_t v=0;
+  for(size_t i=0;i<s.length();i++){
+    char c=s[i];
+    if(c<'0'||c>'9') break;
+    v = v*10 + (uint64_t)(c-'0');
+  }
+  return v;
+}
+
+uint64_t getNumberField64Safe(const String& raw, const char* key){
+  String k = String("\"") + key + "\":";
+  int p = raw.indexOf(k);
+  if(p<0) return 0;
+  p += k.length();
+  while(p<(int)raw.length() && raw[p]==' ') p++;
+  int e = p;
+  while(e<(int)raw.length() && isDigit(raw[e])) e++;
+  if(e<=p) return 0;
+  return parseUint64(raw.substring(p,e));
+}
+
+uint64_t normalizeTsToMs(uint64_t ts){
+  if(ts > 0 && ts < 4000000000ULL) return ts * 1000ULL; // segundos -> ms
+  return ts;
+}
+
+uint64_t nowEpochMs(){
+  time_t now = time(nullptr);
+  if(now >= 100000) return (uint64_t)now * 1000ULL;
+  return (uint64_t)millis();
+}
+
+void markPresence(const String& user){
+  uint64_t e = nowEpochMs();
+  uint32_t m = millis();
+  if(user == String(NAME1)){
+    presence1.user = NAME1;
+    presence1.lastSeenEpochMs = e;
+    presence1.lastSeenMillis  = m;
+  } else if(user == String(NAME2)){
+    presence2.user = NAME2;
+    presence2.lastSeenEpochMs = e;
+    presence2.lastSeenMillis  = m;
+  }
+}
+
+bool isOnline(const Presence& p){
+  if(p.lastSeenMillis == 0) return false;
+  return (millis() - p.lastSeenMillis) <= ONLINE_WINDOW_MS;
+}
+
+String lastSeenFmt(const Presence& p){
+  if(p.lastSeenEpochMs == 0) return "nunca";
+  time_t tt = (time_t)(p.lastSeenEpochMs / 1000ULL);
+  if(tt < 100000) return "nunca";
+  struct tm* t = localtime(&tt);
+  char b[18];
+  snprintf(b, sizeof(b), "%02d/%02d %02d:%02d", t->tm_mday, t->tm_mon+1, t->tm_hour, t->tm_min);
+  return String(b);
+}
+
+// ===================== TIME =====================
+
+void syncTime(){
+  configTime(-3 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  time_t now = time(nullptr);
+  uint32_t start = millis();
+  while (now < 100000 && millis() - start < 15000) {
+    delay(200);
+    now = time(nullptr);
+  }
+}
+
+String hhmm(){
+  time_t now = time(nullptr);
+  if(now < 100000) return "--:--";
+  struct tm* t = localtime(&now);
+  char b[6];
+  snprintf(b, sizeof(b), "%02d:%02d", t->tm_hour, t->tm_min);
+  return String(b);
+}
+
+// ===================== SD =====================
+
+void setupSD(){
+  SPI.begin(); // NodeMCU SPI: D5 SCK, D6 MISO, D7 MOSI
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  delay(50);
+
+  sdOk = SD.begin(SD_CS, SPI_HALF_SPEED);
+  Serial.println(sdOk ? "SD: OK" : "SD: FALHOU");
+
+  if(sdOk && !SD.exists(LOG_PATH)){
+    File f = SD.open(LOG_PATH, FILE_WRITE);
+    if(f) f.close();
+  }
+
+  if(sdOk){
+    File f = SD.open(LOG_PATH, FILE_READ);
+    if(f){ logBytes = f.size(); f.close(); }
+  }
+}
+
+void logAppendLine(const String& line){
+  if(!sdOk) return;
+  File f = SD.open(LOG_PATH, FILE_WRITE);
+  if(!f) return;
+  f.println(line);
+  logBytes = f.size();
+  f.close();
+}
+
+// ===================== BUFFER =====================
+
+void pushMsgToBuffer(uint32_t id, uint64_t ts, const String& name, const String& text, bool deleted,
+                     uint32_t replyToId, const String& replyToName, const String& replyToText){
+  buf[bufHead].id = id;
+  buf[bufHead].ts = ts;
+  buf[bufHead].name = name;
+  buf[bufHead].text = text;
+  buf[bufHead].deleted = deleted;
+
+  buf[bufHead].replyToId   = replyToId;
+  buf[bufHead].replyToName = replyToName;
+  buf[bufHead].replyToText = replyToText;
+
+  bufHead = (bufHead + 1) % BUF_MAX;
+  if(bufCount < BUF_MAX) bufCount++;
+}
+
+int findOldestIndex(){
+  if(bufCount == 0) return -1;
+  int start = (int)bufHead - (int)bufCount;
+  while(start < 0) start += BUF_MAX;
+  return start;
+}
+
+Msg* findMsgById(uint32_t id){
+  int idx = findOldestIndex();
+  if(idx < 0) return nullptr;
+  for(uint16_t i=0;i<bufCount;i++){
+    Msg &m = buf[idx];
+    if(m.id == id) return &m;
+    idx = (idx + 1) % BUF_MAX;
+  }
+  return nullptr;
+}
+
+void clearHistory(){
+  bufCount = 0;
+  bufHead = 0;
+  nextId = 1;
+
+  msgTotal = 0;
+  newMsgs  = 0;
+
+  if(sdOk){
+    SD.remove(LOG_PATH);
+    File f = SD.open(LOG_PATH, FILE_WRITE);
+    if(f) f.close();
+    File r = SD.open(LOG_PATH, FILE_READ);
+    if(r){ logBytes = r.size(); r.close(); }
+    else logBytes = 0;
+  } else {
+    logBytes = 0;
+  }
+}
+
+void loadLastLinesToBuffer(uint16_t maxLines){
+  if(!sdOk) return;
+
+  File f = SD.open(LOG_PATH, FILE_READ);
+  if(!f) return;
+
+  size_t size = f.size();
+  logBytes = size;
+  if(size == 0){ f.close(); return; }
+
+  const size_t CHUNK = 256;
+  long pos = (long)size;
+  int linesFound = 0;
+  String tail = "";
+
+  while(pos > 0 && linesFound <= (int)maxLines){
+    size_t readSize = (pos >= (long)CHUNK) ? CHUNK : (size_t)pos;
+    pos -= (long)readSize;
+    f.seek(pos);
+
+    char bufc[CHUNK+1];
+    size_t n = f.readBytes(bufc, readSize);
+    bufc[n] = 0;
+
+    tail = String(bufc) + tail;
+
+    for(size_t i=0;i<n;i++){
+      if(bufc[i] == '\n') linesFound++;
+    }
+    if(tail.length() > 120000) break;
+  }
+  f.close();
+
+  int total = 0;
+  for(int i=0;i<(int)tail.length();i++) if(tail[i]=='\n') total++;
+  int skip = total - (int)maxLines;
+  if(skip < 0) skip = 0;
+
+  int cur = 0;
+  int startIdx = 0;
+  for(int i=0;i<(int)tail.length();i++){
+    if(tail[i]=='\n'){
+      if(cur < skip){ cur++; startIdx = i+1; }
+      else break;
+    }
+  }
+
+  String line;
+  line.reserve(600);
+
+  msgTotal = 0;
+  nextId = 1;
+
+  for(int i=startIdx; i < (int)tail.length(); i++){
+    char c = tail[i];
+    if(c == '\n'){
+      line.trim();
+      if(line.length()){
+        String type = getField(line, "type");
+
+        if(type == "del"){
+          uint32_t id = (uint32_t)getNumberField64Safe(line, "id");
+          Msg* m = findMsgById(id);
+          if(m){
+            m->deleted = true;
+            m->text = "— apagada —";
+          }
+        } else {
+          // msg (novo formato) ou antigo
+          String name = getField(line, "name");
+          String text = getField(line, "text");
+
+          uint64_t ts = getNumberField64Safe(line, "ts");
+          ts = normalizeTsToMs(ts);
+          if(ts == 0){
+            time_t now = time(nullptr);
+            ts = (now >= 100000) ? (uint64_t)now * 1000ULL : (uint64_t)millis();
+          }
+
+          uint32_t id = (uint32_t)getNumberField64Safe(line, "id");
+          if(id == 0){
+            id = nextId++;
+          } else {
+            if(id >= nextId) nextId = id + 1;
+          }
+
+          bool deleted = (getNumberField64Safe(line, "deleted") == 1);
+
+          uint32_t replyTo = (uint32_t)getNumberField64Safe(line, "replyTo");
+          String replyName = getField(line, "replyName");
+          String replyText = getField(line, "replyText");
+
+          pushMsgToBuffer(id, ts, name, text, deleted, replyTo, replyName, replyText);
+          msgTotal++;
+        }
+      }
+      line = "";
+    } else line += c;
+  }
+}
+
+// ===================== OLED =====================
+
+void oledPrintWrapped(int x, int y, const String& s){
+  const int perLine = 21;
+  int line = 0;
+  for(int i=0; i<(int)s.length(); i+=perLine){
+    display.setCursor(x, y + line*10);
+    display.print(s.substring(i, i+perLine));
+    line++;
+    if(y + line*10 > 56) break;
+  }
+}
+
+void drawOLEDNormal(){
+  if(!display.width()) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  if(siteDisabled){
+    display.setCursor(0,0);
+    display.print("ESP Chat ");
+    display.print(hhmm());
+
+    display.setCursor(0,16);
+    display.print("SITE: OFF");
+
+    display.setCursor(0,28);
+    display.print("Por: ");
+    display.print(siteDisabledBy.length() ? siteDisabledBy : "admin");
+
+    display.setCursor(0,44);
+    display.print("Clique FLASH");
+    display.setCursor(0,54);
+    display.print("para ligar");
+    display.display();
+    return;
+  }
+
+  if(oledPage == 0){
+    display.setCursor(0,0);
+    display.print("ESP Chat ");
+    display.print(hhmm());
+
+    display.setCursor(0,12);
+    display.print("IP: ");
+    display.print(WiFi.localIP());
+
+    display.setCursor(0,22);
+    display.print("SD: ");
+    display.print(sdOk ? "OK" : "FAIL");
+
+    display.setCursor(0,32);
+    display.print("Log: ");
+    display.print(logBytes/1024);
+    display.print("KB");
+
+    display.setCursor(0,42);
+    display.print("Msgs:");
+    display.print(msgTotal);
+
+    display.setCursor(0,52);
+    display.print("New:");
+    display.print(newMsgs);
+  }
+  else if(oledPage == 1){
+    display.setCursor(0,0);
+    display.print("Acesso");
+    display.setCursor(0,12);
+    display.print("Local:");
+    display.setCursor(0,22);
+    display.print(WiFi.localIP());
+    display.print(":");
+    display.print(HTTP_PORT);
+
+    display.setCursor(0,36);
+    display.print("Publico:");
+    display.setCursor(0,46);
+    if(strlen(PUBLIC_URL) == 0){
+      display.print("(vazio)");
+    } else {
+      oledPrintWrapped(0, 46, String(PUBLIC_URL));
+    }
+  }
+  else if(oledPage == 2){
+    display.setCursor(0,0);
+    display.print("FLASH (D3/GPIO0)");
+    display.setCursor(0,12);
+    display.print("Clique: troca tela");
+    display.setCursor(0,22);
+    display.print("+ zera New");
+
+    display.setCursor(0,36);
+    display.print("Segure 3s: aviso");
+    display.setCursor(0,46);
+    display.print("Segure 5s: apaga");
+    display.setCursor(0,56);
+    display.print("chat.log + RAM");
+  }
+  else {
+    bool on1 = isOnline(presence1);
+    bool on2 = isOnline(presence2);
+
+    display.setCursor(0,0);
+    display.print("Usuarios / Online");
+
+    display.setCursor(0,12);
+    display.print(String(NAME1) + ": ");
+    display.print(on1 ? "ON" : "OFF");
+
+    display.setCursor(0,22);
+    display.print("Ult: ");
+    oledPrintWrapped(26, 22, lastSeenFmt(presence1));
+
+    display.setCursor(0,40);
+    display.print(String(NAME2) + ": ");
+    display.print(on2 ? "ON" : "OFF");
+
+    display.setCursor(0,50);
+    display.print("Ult: ");
+    oledPrintWrapped(26, 50, lastSeenFmt(presence2));
+  }
+
+  display.display();
+}
+
+void drawOLEDEraseWarn(){
+  if(!display.width()) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 10);
+  display.print("ATENCAO!");
+  display.setCursor(0, 22);
+  display.print("Segure +2s");
+  display.setCursor(0, 34);
+  display.print("para APAGAR");
+  display.setCursor(0, 46);
+  display.print("SD + historico");
+
+  display.display();
+}
+
+// ===================== SITE OFF PAGE + GUARD =====================
+
+const char SITE_OFF_HTML[] PROGMEM =
+"<!doctype html><html lang='pt-br'><head>"
+"<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>Indisponivel</title>"
+"<style>"
+"body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b141a;color:#fff;"
+"display:flex;align-items:center;justify-content:center;min-height:100vh;padding:18px}"
+".card{max-width:520px;width:100%;background:#111b21;border:1px solid rgba(255,255,255,.10);"
+"border-radius:18px;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.35)}"
+"h1{margin:0 0 10px;font-size:20px}"
+"p{margin:0;color:#aebac1;line-height:1.35}"
+".pill{display:inline-block;margin-top:12px;padding:8px 12px;border-radius:999px;background:#1f2c34;color:#e9f5ef;font-weight:800}"
+"</style></head><body>"
+"<div class='card'>"
+"<h1>Site desligado</h1>"
+"<p>O servidor foi desativado pelo administrador.<br>"
+"Para reativar, pressione o botao <b>FLASH</b> no ESP8266.</p>"
+"<div class='pill'>Aguardando FLASH…</div>"
+"</div></body></html>";
+
+bool guardSiteEnabled(){
+  if(!siteDisabled) return true;
+  noCacheHeaders();
+  server.send(503, "text/html; charset=utf-8", SITE_OFF_HTML);
+  return false;
+}
+
+// ===================== SESSIONS =====================
+
+String makeToken(){
+  uint32_t r1 = ESP.getCycleCount() ^ micros() ^ millis();
+  uint32_t r2 = random(0xFFFFFFFF);
+  return String(r1, HEX) + String(r2, HEX);
+}
+
+void cleanupSessions(){
+  uint32_t now = millis();
+  for(auto &s : chatSessions){
+    if(!s.used) continue;
+    if(now - s.issuedMs > SESSION_TTL_MS){
+      s.used = false;
+      s.token = "";
+      s.user = "";
+      s.pageServed = false;
+    }
+  }
+}
+
+String createSession(const String& user){
+  cleanupSessions();
+  IPAddress ip = server.client().remoteIP();
+  String t = makeToken();
+
+  for(auto &s : chatSessions){
+    if(!s.used){
+      s.used = true;
+      s.token = t;
+      s.user = user;
+      s.ip = ip;
+      s.issuedMs = millis();
+      s.pageServed = false;
+      return t;
+    }
+  }
+  chatSessions[0].used = true;
+  chatSessions[0].token = t;
+  chatSessions[0].user = user;
+  chatSessions[0].ip = ip;
+  chatSessions[0].issuedMs = millis();
+  chatSessions[0].pageServed = false;
+  return t;
+}
+
+ChatSession* findSession(const String& token){
+  cleanupSessions();
+  IPAddress ip = server.client().remoteIP();
+  for(auto &s : chatSessions){
+    if(s.used && s.token == token && s.ip == ip){
+      return &s;
+    }
+  }
+  return nullptr;
+}
+
+bool requireToken(String &userOut){
+  if(!server.hasArg("token")){
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "Login required");
+    return false;
+  }
+  String token = server.arg("token");
+  ChatSession* s = findSession(token);
+  if(!s){
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "Login required");
+    return false;
+  }
+  userOut = s->user;
+  markPresence(userOut);
+  return true;
+}
+
+bool requireChatPageToken(String &userOut, String &tokenOut){
+  if(!server.hasArg("token")){
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "Login required");
+    return false;
+  }
+  String token = server.arg("token");
+  ChatSession* s = findSession(token);
+  if(!s){
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "Login required");
+    return false;
+  }
+  if(s->pageServed){
+    server.sendHeader("Location", "/");
+    server.send(302, "text/plain", "Login required");
+    return false;
+  }
+  s->pageServed = true;
+  userOut = s->user;
+  tokenOut = token;
+  markPresence(userOut);
+  return true;
+}
+
+// ===================== WEB PAGES =====================
+
+const char LOGIN_HTML[] PROGMEM =
+"<!doctype html><html lang='pt-br'><head>"
+"<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>Login - ESP8266</title>"
+"<style>"
+":root{--bg:#0b141a;--card:#111b21;--accent:#25d366;--muted:#aebac1;}"
+"*{box-sizing:border-box}"
+"body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#081015,#0b141a);color:#fff;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
+".card{width:min(420px,100%);background:rgba(17,27,33,.92);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:18px;box-shadow:0 20px 60px rgba(0,0,0,.35)}"
+".title{font-weight:900;font-size:22px;margin:0 0 6px}"
+".sub{color:var(--muted);margin:0 0 16px;font-size:13px}"
+"label{display:block;color:var(--muted);font-size:12px;margin:10px 0 6px}"
+"select,input{width:100%;padding:12px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.12);background:#0b141a;color:#fff;font-size:15px;outline:none}"
+".btn{margin-top:14px;width:100%;padding:12px 14px;border-radius:14px;border:0;background:var(--accent);color:#062b12;font-weight:900;font-size:15px;cursor:pointer}"
+".hint{margin-top:10px;color:var(--muted);font-size:12px;line-height:1.35}"
+"</style></head><body>"
+"<div class='card'>"
+"  <div class='title'>ESP8266</div>"
+"  <div class='sub'>Login obrigatorio (sempre). Selecione o usuario e digite a senha.</div>"
+"  <form method='POST' action='/auth'>"
+"    <label>Usuario</label>"
+"    <select name='u'>"
+"      <option value='usuario1'>Usuario 1</option>"
+"      <option value='usuario2'>Usuario 2</option>"
+"    </select>"
+"    <label>Senha</label>"
+"    <input type='password' name='p' placeholder='Senha' autocomplete='off' required>"
+"    <button class='btn' type='submit'>Entrar</button>"
+"  </form>"
+"  <div class='hint'>Site TESTE para automação via alexa</div>"
+"</div></body></html>";
+
+String headerTabsHtml(const String& me, const String& token, bool onlineTab){
+  String h;
+  h.reserve(900);
+  h += "<div id='top'>";
+  h += " <div style='display:flex;flex-direction:column;gap:2px'>";
+  h += "  <div id='title'>ESP Chat</div>";
+  h += "  <div class='pill'>Voce: " + me + "</div>";
+  h += " </div>";
+  h += " <div style='display:flex;gap:10px;align-items:center'>";
+  h += "  <div class='tabs'>";
+  h += "   <a class='tab " + String(onlineTab ? "" : "on") + "' href='/chat?token=" + token + "'>Chat</a>";
+  h += "   <a class='tab " + String(onlineTab ? "on" : "") + "' href='/presencepage?token=" + token + "'>Online</a>";
+  h += "  </div>";
+  h += "  <div id='st'>Conectando…</div>";
+  h += " </div>";
+  h += "</div>";
+  return h;
+}
+
+String chatPageHtml(const String& me, const String& token){
+  String html;
+  html.reserve(20000);
+
+  html += "<!doctype html><html lang='pt-br'><head>";
+  html += "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1'>";
+  html += "<title>ESP Chat</title><style>";
+  html += ":root{--bg:#0b141a;--card:#111b21;--top:#075e54;--accent:#25d366;--muted:#aebac1;}";
+  html += "*{box-sizing:border-box}";
+  html += "body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:#fff;height:100dvh;display:flex;flex-direction:column}";
+  html += "#top{background:var(--top);padding:10px 12px;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}";
+  html += "#title{font-weight:900;letter-spacing:.2px}";
+  html += "#st{font-size:13px;color:#e9f5ef;opacity:.95;white-space:nowrap}";
+  html += ".pill{font-size:12px;color:#e9f5ef;opacity:.95}";
+  html += ".tabs{display:flex;gap:8px;align-items:center}";
+  html += ".tab{display:inline-block;text-decoration:none;border-radius:999px;padding:8px 12px;font-weight:900;cursor:pointer;background:#1f2c34;color:#e9f5ef}";
+  html += ".tab.on{background:var(--accent);color:#062b12}";
+  html += "#wrap{flex:1;display:flex;flex-direction:column;min-height:0}";
+  html += "#chat{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px;background:linear-gradient(180deg,#0b141a,#0a1015)}";
+  html += ".msg{max-width:88%;padding:10px 12px;border-radius:14px;background:var(--card);box-shadow:0 1px 0 rgba(255,255,255,.06) inset;position:relative}";
+  html += ".me{align-self:flex-end;background:#1f2c34}";
+  html += ".meta{font-size:12px;color:var(--muted);margin-bottom:6px;display:flex;gap:8px;align-items:center;justify-content:space-between}";
+  html += ".metaLeft{display:flex;gap:8px;align-items:center;min-width:0}";
+  html += ".metaRight{display:flex;gap:6px;align-items:center;flex:0 0 auto}";
+  html += ".text{white-space:pre-wrap;word-break:break-word;font-size:15px;line-height:1.25}";
+  html += ".iconBtn{border:0;background:transparent;color:#aebac1;font-size:16px;cursor:pointer;padding:4px 6px;border-radius:10px}";
+  html += ".iconBtn:hover{background:rgba(255,255,255,.08)}";
+  html += ".quote{border-left:3px solid rgba(255,255,255,.25);padding:6px 8px;margin:0 0 8px 0;border-radius:10px;background:rgba(255,255,255,.04);cursor:pointer}";
+  html += ".qname{font-weight:900;font-size:12px;color:#e9f5ef}";
+  html += ".qtext{font-size:12px;color:#aebac1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}";
+  html += "#bar{padding:10px;display:flex;flex-direction:column;gap:8px;background:#0f171d;border-top:1px solid rgba(255,255,255,.06)}";
+  html += "#row{display:flex;gap:8px;align-items:flex-end}";
+  html += "textarea{flex:1;min-height:44px;max-height:120px;resize:none;border:1px solid rgba(255,255,255,.12);background:#0b141a;color:#fff;border-radius:14px;padding:10px 12px;font-size:15px;outline:none}";
+  html += "button{border:0;border-radius:14px;background:var(--accent);color:#062b12;font-weight:900;padding:11px 14px;font-size:15px;cursor:pointer}";
+  html += "button:active{transform:translateY(1px)}";
+  html += ".btnWarn{background:#ffcc00 !important;color:#1a1300 !important;border-radius:999px !important;padding:8px 12px !important;font-weight:900 !important}";
+  html += ".btnSmall{border-radius:999px !important;padding:8px 12px !important;font-weight:900 !important;background:#1f2c34 !important;color:#e9f5ef !important}";
+  html += "</style></head><body>";
+
+  html += headerTabsHtml(me, token, false);
+
+  html += "<div id='wrap'><div id='chat'></div>";
+  html += "<div id='bar'>";
+
+  // Reply bar
+  html += "<div id='replybar' style='display:none;width:100%;background:#111b21;border:1px solid rgba(255,255,255,.10);border-radius:14px;padding:10px 12px;'>";
+  html += " <div style='display:flex;align-items:center;justify-content:space-between;gap:10px'>";
+  html += "  <div style='min-width:0'>";
+  html += "   <div id='replyto' style='font-weight:900;font-size:13px;color:#e9f5ef'></div>";
+  html += "   <div id='replytxt' style='font-size:13px;color:#aebac1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:70vw'></div>";
+  html += "  </div>";
+  html += "  <button id='replyclear' class='btnSmall' type='button'>X</button>";
+  html += " </div>";
+  html += "</div>";
+
+  html += "<div id='row'>";
+  html += "<textarea id='text' placeholder='Mensagem...' maxlength='200'></textarea>";
+  html += "<button id='send' type='button'>Enviar</button>";
+  html += "</div>";
+
+  html += "</div></div>";
+
+  html += "<script>";
+  html += "const TOKEN=" + String("'") + token + String("'") + ";";
+  html += "const MY=" + String("'") + me + String("'") + ";";
+  html += "const chat=document.getElementById('chat');";
+  html += "const textEl=document.getElementById('text');";
+  html += "const sendBtn=document.getElementById('send');";
+  html += "const st=document.getElementById('st');";
+
+  html += "const replybar=document.getElementById('replybar');";
+  html += "const replyto=document.getElementById('replyto');";
+  html += "const replytxt=document.getElementById('replytxt');";
+  html += "const replyclear=document.getElementById('replyclear');";
+
+  html += "let lastId=0, polling=false, backoff=600;";
+  html += "let replyToId=0, replyToName='', replyToText='';";
+
+  // UI helpers
+  html += "function setReply(m){";
+  html += " replyToId=Number(m.id||0);";
+  html += " replyToName=String(m.name||'');";
+  html += " replyToText=String(m.deleted ? '— apagada —' : (m.text||''));";
+  html += " replyto.textContent='Respondendo a ' + replyToName;";
+  html += " replytxt.textContent=replyToText;";
+  html += " replybar.style.display='block';";
+  html += " textEl.focus();";
+  html += "}";
+  html += "function clearReply(){ replyToId=0; replyToName=''; replyToText=''; replybar.style.display='none'; }";
+  html += "replyclear.onclick=clearReply;";
+
+  // Delete request
+  html += "async function delMsg(id){";
+  html += " try{";
+  html += "  const r=await fetch('/delete?token='+encodeURIComponent(TOKEN)+'&id='+encodeURIComponent(id),{cache:'no-store'});";
+  html += "  if(!r.ok) throw new Error('del');";
+  html += "  const data=await r.json().catch(()=>({ok:true}));";
+  html += "  return !!data.ok;";
+  html += " }catch(e){ alert('Falhou apagar.'); return false; }";
+  html += "}";
+
+  // Render
+  html += "function addMsg(m){";
+  html += " const d=document.createElement('div');";
+  html += " const isMe=(String(m.name||'')===MY);";
+  html += " d.className='msg'+(isMe?' me':'');";
+  html += " d.dataset.id=String(m.id||'0');";
+
+  html += " const t=new Date(m.ts||Date.now()).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});";
+
+  html += " const meta=document.createElement('div'); meta.className='meta';";
+  html += " const ml=document.createElement('div'); ml.className='metaLeft';";
+  html += " const left=document.createElement('span'); left.textContent=`${m.name||'Anon'} • ${t}`;";
+  html += " ml.appendChild(left);";
+
+  html += " const mr=document.createElement('div'); mr.className='metaRight';";
+
+  // Reply button ↩ (sempre)
+  html += " const rep=document.createElement('button'); rep.className='iconBtn'; rep.title='Responder'; rep.textContent='↩';";
+  html += " rep.onclick=(ev)=>{ ev.stopPropagation(); if(m && m.id) setReply(m); };";
+  html += " mr.appendChild(rep);";
+
+  // Trash button 🗑 (só se for minha msg e não deletada)
+  html += " if(isMe && !m.deleted){";
+  html += "  const tr=document.createElement('button'); tr.className='iconBtn'; tr.title='Apagar mensagem'; tr.textContent='🗑';";
+  html += "  tr.onclick=async(ev)=>{";
+  html += "   ev.stopPropagation();";
+  html += "   const id=Number(d.dataset.id||0); if(!id) return;";
+  html += "   if(!confirm('Apagar esta mensagem?')) return;";
+  html += "   const ok=await delMsg(id);";
+  html += "   if(ok){";
+  html += "     const body=d.querySelector('.text'); if(body) body.textContent='— apagada —';";
+  html += "     tr.remove();";
+  html += "   }";
+  html += "  };";
+  html += "  mr.appendChild(tr);";
+  html += " }";
+
+  html += " meta.appendChild(ml); meta.appendChild(mr);";
+  html += " d.appendChild(meta);";
+
+  // Quote (reply) - estilo WhatsApp
+  html += " if(m.replyTo && Number(m.replyTo)>0){";
+  html += "  const q=document.createElement('div'); q.className='quote';";
+  html += "  const qn=document.createElement('div'); qn.className='qname'; qn.textContent=String(m.replyName||'Mensagem');";
+  html += "  const qt=document.createElement('div'); qt.className='qtext'; qt.textContent=String(m.replyText||'');";
+  html += "  q.appendChild(qn); q.appendChild(qt);";
+  html += "  q.onclick=(ev)=>{";
+  html += "   ev.stopPropagation();";
+  html += "   const el=document.querySelector('.msg[data-id=\"'+m.replyTo+'\"]');";
+  html += "   if(el) el.scrollIntoView({behavior:'smooth', block:'center'});";
+  html += "  };";
+  html += "  d.appendChild(q);";
+  html += " }";
+
+  // Body
+  html += " const body=document.createElement('div'); body.className='text';";
+  html += " body.textContent = (m.deleted ? '— apagada —' : String(m.text||''));";
+  html += " d.appendChild(body);";
+
+  html += " chat.appendChild(d);";
+  html += " chat.scrollTop=chat.scrollHeight;";
+  html += "}";
+
+  // Poll
+  html += "async function poll(){";
+  html += " if(polling) return; polling=true;";
+  html += " try{";
+  html += "  const r=await fetch('/poll?token='+encodeURIComponent(TOKEN)+'&after='+lastId,{cache:'no-store'});";
+  html += "  if(!r.ok) throw new Error('bad');";
+  html += "  const data=await r.json();";
+  html += "  if(Array.isArray(data.msgs)){";
+  html += "    for(const m of data.msgs){ addMsg(m); if(m.id) lastId=m.id; }";
+  html += "  }";
+  html += "  st.textContent='Conectado ✅'; backoff=600;";
+  html += " }catch(e){ st.textContent='Desconectado ❌'; backoff=Math.min(backoff*1.6, 4000); }";
+  html += " finally{ polling=false; setTimeout(poll, backoff);} }";
+
+  // Send
+  html += "async function send(){";
+  html += " const text=textEl.value.trim(); if(!text) return;";
+  html += " try{";
+  html += "  const payload={text:text, ts:Date.now(), replyTo:replyToId};";
+  html += "  const r=await fetch('/send?token='+encodeURIComponent(TOKEN),{method:'POST',headers:{'Content-Type':'application/json','Cache-Control':'no-store'},body:JSON.stringify(payload)});";
+  html += "  if(!r.ok) throw new Error('send');";
+  html += "  textEl.value=''; textEl.style.height='44px';";
+  html += "  clearReply();";
+  html += "  textEl.focus();";
+  html += " }catch{ addMsg({id:0,name:'Sistema',text:'Falhou enviar. Sem conexao?',ts:Date.now(),deleted:false,replyTo:0,replyName:'',replyText:''}); } }";
+
+  // Admin OFF (ambos)
+  html += "(() => {";
+  html += " const top=document.getElementById('top');";
+  html += " const wrap=document.createElement('div');";
+  html += " wrap.style.display='flex'; wrap.style.gap='8px'; wrap.style.alignItems='center';";
+  html += " const off=document.createElement('button');";
+  html += " off.textContent='Desligar site'; off.className='btnWarn';";
+  html += " off.onclick=async()=>{";
+  html += "  if(!confirm('Desligar o site agora? So volta com FLASH.')) return;";
+  html += "  try{";
+  html += "    const r=await fetch('/admin/off?token='+encodeURIComponent(TOKEN),{cache:'no-store'});";
+  html += "    if(!r.ok) throw new Error('off');";
+  html += "    location.href='/';";
+  html += "  }catch{ alert('Falhou desligar'); }";
+  html += " };";
+  html += " wrap.appendChild(off);";
+  html += " top.appendChild(wrap);";
+  html += "})();";
+
+  html += "sendBtn.onclick=send;";
+  html += "textEl.addEventListener('input',()=>{textEl.style.height='auto'; textEl.style.height=Math.min(textEl.scrollHeight,120)+'px';});";
+  html += "textEl.addEventListener('keydown',(e)=>{ if(e.key==='Enter' && !e.shiftKey){e.preventDefault(); send();}});";
+  html += "poll();";
+  html += "</script>";
+
+  html += "</body></html>";
+  return html;
+}
+
+String presencePageHtml(const String& me, const String& token){
+  String html;
+  html.reserve(6500);
+
+  html += "<!doctype html><html lang='pt-br'><head>";
+  html += "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Online</title><style>";
+  html += ":root{--bg:#0b141a;--card:#111b21;--top:#075e54;--accent:#25d366;--muted:#aebac1;}";
+  html += "*{box-sizing:border-box}";
+  html += "body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:var(--bg);color:#fff;min-height:100vh;display:flex;flex-direction:column}";
+  html += "#top{background:var(--top);padding:10px 12px;display:flex;align-items:center;justify-content:space-between;gap:10px}";
+  html += "#title{font-weight:900;letter-spacing:.2px}";
+  html += "#st{font-size:13px;color:#e9f5ef;opacity:.95;white-space:nowrap}";
+  html += ".pill{font-size:12px;color:#e9f5ef;opacity:.95}";
+  html += ".tabs{display:flex;gap:8px;align-items:center}";
+  html += ".tab{display:inline-block;text-decoration:none;border-radius:999px;padding:8px 12px;font-weight:900;cursor:pointer;background:#1f2c34;color:#e9f5ef}";
+  html += ".tab.on{background:var(--accent);color:#062b12}";
+  html += "#list{padding:12px;display:flex;flex-direction:column;gap:10px}";
+  html += ".card{background:rgba(17,27,33,.92);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:12px}";
+  html += ".row{display:flex;align-items:center;justify-content:space-between;gap:10px}";
+  html += ".name{font-weight:900}";
+  html += ".badge{font-size:12px;font-weight:900;padding:6px 10px;border-radius:999px;background:#1f2c34;color:#e9f5ef}";
+  html += ".badge.on{background:var(--accent);color:#062b12}";
+  html += ".meta{color:var(--muted);font-size:12px;margin-top:6px}";
+  html += "</style></head><body>";
+
+  html += headerTabsHtml(me, token, true);
+  html += "<div id='list'><div class='card'>Carregando…</div></div>";
+
+  html += "<script>";
+  html += "const TOKEN=" + String("'") + token + String("'") + ";";
+  html += "const list=document.getElementById('list');";
+  html += "const st=document.getElementById('st');";
+  html += "function fmt(ts){ if(!ts) return 'nunca'; const d=new Date(ts); return d.toLocaleString([], {day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'}); }";
+  html += "function render(users){";
+  html += " list.innerHTML='';";
+  html += " for(const u of users){";
+  html += "  const c=document.createElement('div'); c.className='card';";
+  html += "  const r=document.createElement('div'); r.className='row';";
+  html += "  const n=document.createElement('div'); n.className='name'; n.textContent=u.user||'?';";
+  html += "  const b=document.createElement('div'); b.className='badge'+(u.online?' on':''); b.textContent=u.online?'Online ✅':'Offline';";
+  html += "  r.appendChild(n); r.appendChild(b);";
+  html += "  const m=document.createElement('div'); m.className='meta'; m.textContent='Ultimo acesso: '+fmt(u.lastSeenTs);";
+  html += "  c.appendChild(r); c.appendChild(m); list.appendChild(c);";
+  html += " }";
+  html += "}";
+  html += "async function refresh(){";
+  html += " try{";
+  html += "  const r=await fetch('/presence?token='+encodeURIComponent(TOKEN),{cache:'no-store'});";
+  html += "  if(!r.ok) throw new Error('p');";
+  html += "  const data=await r.json();";
+  html += "  if(Array.isArray(data.users)) render(data.users);";
+  html += "  st.textContent='Conectado ✅';";
+  html += " }catch(e){";
+  html += "  st.textContent='Desconectado ❌';";
+  html += "  list.innerHTML='<div class=card>Falhou carregar.</div>';";
+  html += " }";
+  html += " setTimeout(refresh, 1500);";
+  html += "}";
+  html += "refresh();";
+  html += "</script>";
+
+  html += "</body></html>";
+  return html;
+}
+
+// ===================== HTTP HANDLERS =====================
+
+void handleLoginPage(){
+  if(!guardSiteEnabled()) return;
+  noCacheHeaders();
+  server.send(200, "text/html; charset=utf-8", LOGIN_HTML);
+}
+
+void handleAuth(){
+  if(!guardSiteEnabled()) return;
+  noCacheHeaders();
+
+  String u = server.arg("u"); u.trim(); u.toLowerCase();
+  String p = server.arg("p"); p.trim();
+
+  bool ok = false;
+  String displayName;
+
+  if(u == LOGIN1 && p == PASS1){ ok = true; displayName = NAME1; }
+  else if(u == LOGIN2 && p == PASS2){ ok = true; displayName = NAME2; }
+
+  if(!ok){
+    server.send(401, "text/plain; charset=utf-8", "Login invalido");
+    return;
+  }
+
+  String token = createSession(displayName);
+  markPresence(displayName);
+  server.sendHeader("Location", String("/chat?token=") + token);
+  server.send(302, "text/plain", "OK");
+}
+
+void handleChat(){
+  if(!guardSiteEnabled()) return;
+  String me, token;
+  if(!requireChatPageToken(me, token)) return;
+  noCacheHeaders();
+  server.send(200, "text/html; charset=utf-8", chatPageHtml(me, token));
+}
+
+void handlePresencePage(){
+  if(!guardSiteEnabled()) return;
+  String me;
+  if(!requireToken(me)) return;
+  noCacheHeaders();
+  server.send(200, "text/html; charset=utf-8", presencePageHtml(me, server.arg("token")));
+}
+
+void handleSend(){
+  if(!guardSiteEnabled()) return;
+  String user;
+  if(!requireToken(user)) return;
+  noCacheHeaders();
+
+  String body = server.arg("plain");
+  String text = getField(body, "text").substring(0, 200);
+
+  uint64_t ts = getNumberField64Safe(body, "ts");
+  ts = normalizeTsToMs(ts);
+
+  if(ts == 0){
+    time_t now = time(nullptr);
+    ts = (now >= 100000) ? (uint64_t)now * 1000ULL : (uint64_t)millis();
+  }
+
+  if(text.length()==0){
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false}");
+    return;
+  }
+
+  // Reply parsing
+  uint32_t replyTo = (uint32_t)getNumberField64Safe(body, "replyTo");
+  String replyName = "";
+  String replyText = "";
+  if(replyTo != 0){
+    Msg* r = findMsgById(replyTo);
+    if(r){
+      replyName = r->name;
+      replyText = r->deleted ? String("— apagada —") : r->text;
+    } else {
+      replyTo = 0;
+    }
+  }
+
+  uint32_t id = nextId++;
+
+  // Log com type + id + reply snapshot
+  String line = String("{\"type\":\"msg\",\"id\":") + String(id) +
+                ",\"name\":\"" + jsonEscape(user) +
+                "\",\"text\":\"" + jsonEscape(text) +
+                "\",\"ts\":" + String((unsigned long long)ts) +
+                ",\"deleted\":0" +
+                ",\"replyTo\":" + String(replyTo) +
+                ",\"replyName\":\"" + jsonEscape(replyName) + "\"" +
+                ",\"replyText\":\"" + jsonEscape(replyText) + "\"" +
+                "}";
+  logAppendLine(line);
+
+  pushMsgToBuffer(id, ts, user, text, false, replyTo, replyName, replyText);
+
+  msgTotal++;
+  newMsgs++;
+
+  server.send(200, "application/json; charset=utf-8",
+              String("{\"ok\":true,\"id\":") + String(id) + "}");
+}
+
+void handlePoll(){
+  if(!guardSiteEnabled()) return;
+  String user;
+  if(!requireToken(user)) return;
+  noCacheHeaders();
+
+  uint32_t after = 0;
+  if(server.hasArg("after")) after = (uint32_t)server.arg("after").toInt();
+
+  String out = "{\"msgs\":[";
+  bool first = true;
+
+  int idx = findOldestIndex();
+  for(uint16_t i=0; i<bufCount; i++){
+    Msg &m = buf[idx];
+    if(m.id > after){
+      if(!first) out += ",";
+      first = false;
+
+      out += String("{\"id\":") + m.id +
+             ",\"name\":\"" + jsonEscape(m.name) +
+             "\",\"text\":\"" + jsonEscape(m.deleted ? String("— apagada —") : m.text) +
+             "\",\"ts\":" + String((unsigned long long)m.ts) +
+             ",\"deleted\":" + (m.deleted ? "true" : "false") +
+             ",\"replyTo\":" + String(m.replyToId) +
+             ",\"replyName\":\"" + jsonEscape(m.replyToName) +
+             "\",\"replyText\":\"" + jsonEscape(m.replyToText) + "\"" +
+             "}";
+    }
+    idx = (idx + 1) % BUF_MAX;
+  }
+
+  out += "]}";
+  server.send(200, "application/json; charset=utf-8", out);
+}
+
+// Presença: lista usuários, online/offline e último acesso
+void handlePresence(){
+  if(!guardSiteEnabled()) return;
+  String user;
+  if(!requireToken(user)) return;
+  noCacheHeaders();
+
+  if(presence1.user.length()==0) presence1.user = NAME1;
+  if(presence2.user.length()==0) presence2.user = NAME2;
+
+  bool on1 = isOnline(presence1);
+  bool on2 = isOnline(presence2);
+
+  String out = "{\"users\":[";
+  out += String("{\"user\":\"") + jsonEscape(presence1.user) + "\",\"online\":" + (on1?"true":"false") +
+         ",\"lastSeenTs\":" + String((unsigned long long)presence1.lastSeenEpochMs) + "},";
+  out += String("{\"user\":\"") + jsonEscape(presence2.user) + "\",\"online\":" + (on2?"true":"false") +
+         ",\"lastSeenTs\":" + String((unsigned long long)presence2.lastSeenEpochMs) + "}";
+  out += "]}";
+  server.send(200, "application/json; charset=utf-8", out);
+}
+
+// GET /delete?token=...&id=123  -> apaga SOMENTE se a msg for do próprio user
+void handleDelete(){
+  if(!guardSiteEnabled()) return;
+  String user;
+  if(!requireToken(user)) return;
+  noCacheHeaders();
+
+  if(!server.hasArg("id")){
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"err\":\"missing_id\"}");
+    return;
+  }
+
+  uint32_t id = (uint32_t)server.arg("id").toInt();
+  if(id == 0){
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"err\":\"bad_id\"}");
+    return;
+  }
+
+  Msg* m = findMsgById(id);
+  if(!m){
+    server.send(404, "application/json; charset=utf-8", "{\"ok\":false,\"err\":\"not_found\"}");
+    return;
+  }
+
+  if(m->name != user){
+    server.send(403, "application/json; charset=utf-8", "{\"ok\":false,\"err\":\"not_owner\"}");
+    return;
+  }
+
+  if(m->deleted){
+    server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"already\":true}");
+    return;
+  }
+
+  m->deleted = true;
+  m->text = "— apagada —";
+
+  // Registra deleção no SD
+  uint64_t ts = nowEpochMs();
+  String line = String("{\"type\":\"del\",\"id\":") + String(id) +
+                ",\"by\":\"" + jsonEscape(user) +
+                "\",\"ts\":" + String((unsigned long long)ts) + "}";
+  logAppendLine(line);
+
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+}
+
+// ADMIN: desliga o site (os dois podem)
+void handleAdminOff(){
+  String user;
+  if(!requireToken(user)) return;
+  noCacheHeaders();
+
+  if(user != String(NAME1) && user != String(NAME2)){
+    server.send(403, "application/json; charset=utf-8", "{\"ok\":false,\"err\":\"forbidden\"}");
+    return;
+  }
+
+  siteDisabled = true;
+  siteDisabledBy = user;
+  siteDisabledAtMs = millis();
+
+  for(auto &s : chatSessions){
+    s.used = false;
+    s.token = "";
+    s.user = "";
+    s.pageServed = false;
+  }
+
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+  drawOLEDNormal();
+}
+
+// ===================== FLASH BUTTON =====================
+
+void handleFlashButton(){
+  bool pressed = (digitalRead(FLASH_PIN) == LOW);
+  uint32_t now = millis();
+
+  if(now - lastBtnEdgeMs < 30) return;
+
+  if(pressed && !btnDown){
+    btnDown = true;
+    btnDownMs = now;
+    warnShown = false;
+    lastBtnEdgeMs = now;
+    return;
+  }
+
+  if(btnDown && pressed){
+    uint32_t held = now - btnDownMs;
+
+    if(held >= WARN_PRESS_MS && !warnShown){
+      warnShown = true;
+      drawOLEDEraseWarn();
+    }
+
+    if(held >= ERASE_PRESS_MS){
+      clearHistory();
+      warnShown = false;
+      btnDown = false;
+      drawOLEDNormal();
+    }
+    return;
+  }
+
+  if(!pressed && btnDown){
+    uint32_t held = now - btnDownMs;
+    btnDown = false;
+    lastBtnEdgeMs = now;
+
+    if(held < WARN_PRESS_MS){
+      if(siteDisabled){
+        siteDisabled = false;
+        siteDisabledBy = "";
+        siteDisabledAtMs = 0;
+        warnShown = false;
+        drawOLEDNormal();
+        return;
+      }
+
+      oledPage = (oledPage + 1) % OLED_PAGES;
+      newMsgs = 0;
+      drawOLEDNormal();
+    } else {
+      drawOLEDNormal();
+    }
+  }
+}
+
+// ===================== SETUP/LOOP =====================
+
+void setup(){
+  Serial.begin(115200);
+  randomSeed(ESP.getCycleCount() ^ micros() ^ millis());
+
+  pinMode(FLASH_PIN, INPUT_PULLUP);
+
+  // OLED I2C (NodeMCU: SDA=D2, SCL=D1)
+  Wire.begin(D2, D1);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)){
+    Serial.println("OLED nao achou (0x3C).");
+  } else {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.println("ESP Chat");
+    display.println("Boot...");
+    display.display();
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("Conectando");
+  while(WiFi.status()!=WL_CONNECTED){ delay(300); Serial.print("."); }
+  Serial.println();
+  Serial.print("IP local: ");
+  Serial.println(WiFi.localIP());
+
+  syncTime();
+  setupSD();
+  loadLastLinesToBuffer(BUF_MAX);
+
+  presence1.user = NAME1;
+  presence2.user = NAME2;
+
+  server.on("/", HTTP_GET, handleLoginPage);
+  server.on("/auth", HTTP_POST, handleAuth);
+  server.on("/chat", HTTP_GET, handleChat);
+  server.on("/presencepage", HTTP_GET, handlePresencePage);
+
+  server.on("/send", HTTP_POST, handleSend);
+  server.on("/poll", HTTP_GET, handlePoll);
+
+  server.on("/presence", HTTP_GET, handlePresence);
+
+  server.on("/admin/off", HTTP_GET, handleAdminOff);
+
+  // apagar mensagens
+  server.on("/delete", HTTP_GET, handleDelete);
+
+  server.begin();
+  Serial.printf("Abra: http://%s:%u\n", WiFi.localIP().toString().c_str(), HTTP_PORT);
+
+  drawOLEDNormal();
+}
+
+void loop(){
+  server.handleClient();
+  handleFlashButton();
+
+  if(millis() - lastUiMs > 1000){
+    lastUiMs = millis();
+    if(!warnShown) drawOLEDNormal();
+  }
+}
