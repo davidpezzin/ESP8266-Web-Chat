@@ -90,6 +90,6 @@ Contribuições são bem‑vindas! Abra uma issue para discutir alterações ou 
 ---
 
 ## Licença
-Escolha a licença do projeto (ex.: MIT). Se você quiser, eu posso sugerir um arquivo LICENSE com o conteúdo da MIT.
+
 
 ---
